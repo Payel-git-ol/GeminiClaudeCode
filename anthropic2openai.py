@@ -13,13 +13,13 @@ GEMINI_API_KEY = "sk-gemini"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 8082
 
-# Model ids the gemini-web2api backend actually understands. Anything we
-# forward MUST be one of these, otherwise the backend answers
-# "model '...' not found" (HTTP 400) and Claude Code reports the model as
-# unavailable (see issue #3).
-BACKEND_FLASH = "gemini-2.5-flash"
-BACKEND_FLASH_THINKING = "gemini-2.5-flash-thinking"
-BACKEND_PRO = "gemini-2.5-pro"
+# Model ids the gemini-web2api backend actually understands (see
+# gemini-web2api/gemini_web2api/models.py MODELS). Anything we forward MUST be
+# one of these, otherwise the backend answers "model '...' not found"
+# (HTTP 400) and Claude Code reports the model as unavailable (issue #3).
+BACKEND_FLASH = "gemini-3.5-flash"
+BACKEND_FLASH_THINKING = "gemini-3.5-flash-thinking"
+BACKEND_PRO = "gemini-3.1-pro"
 
 # Translate every model name a client may send into a backend model id.
 # Claude Code sends either a Claude model id (when gateway model discovery is
@@ -36,11 +36,15 @@ MODEL_MAP = {
     # means users whose saved default is e.g. "gemini-3.5-flash" keep working.
     "gemini-3.5-flash-thinking": BACKEND_FLASH_THINKING,
     "gemini-3.5-flash": BACKEND_FLASH,
-    "gemini-flash-lite": BACKEND_FLASH,
     # Real backend ids pass through unchanged (listed for clarity / safety).
-    "gemini-2.5-flash": BACKEND_FLASH,
-    "gemini-2.5-flash-thinking": BACKEND_FLASH_THINKING,
-    "gemini-2.5-pro": BACKEND_PRO,
+    "gemini-3.5-flash": "gemini-3.5-flash",
+    "gemini-3.5-flash-thinking": "gemini-3.5-flash-thinking",
+    "gemini-3.1-pro": "gemini-3.1-pro",
+    # Standalone backend (run-claude.ps1) has no "-enhanced" variant; use pro.
+    "gemini-3.1-pro-enhanced": "gemini-3.1-pro",
+    "gemini-auto": "gemini-auto",
+    "gemini-3.5-flash-thinking-lite": "gemini-3.5-flash-thinking-lite",
+    "gemini-flash-lite": "gemini-flash-lite",
 }
 
 AVAILABLE_MODELS = [
@@ -193,9 +197,9 @@ def anthropic_messages_to_openai(body: dict) -> dict:
         "stream": body.get("stream", False),
         "max_tokens": body.get("max_tokens", 4096),
     }
-    if body.get("temperature"):
+    if body.get("temperature") is not None:
         openai_body["temperature"] = body["temperature"]
-    if body.get("top_p"):
+    if body.get("top_p") is not None:
         openai_body["top_p"] = body["top_p"]
     tools = convert_tools(body.get("tools"))
     if tools:
@@ -268,8 +272,10 @@ def proxy_non_stream(openai_body: dict) -> tuple:
             result = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return json.dumps({"error": {"message": e.read().decode(), "type": "api_error"}}).encode(), e.code
+    except (urllib.error.URLError, OSError) as e:
+        return json.dumps({"error": {"message": f"upstream error: {e}", "type": "api_error"}}).encode(), 502
     anthropic = openai_response_to_anthropic(result)
-    return json.dumps(anthropic).encode(), 200
+    return json.dumps(anthropic, ensure_ascii=False).encode(), 200
 
 
 def proxy_stream(openai_body: dict):
@@ -290,11 +296,14 @@ def proxy_stream(openai_body: dict):
         error_body = e.read().decode()
         yield f"event: error\ndata: {json.dumps({'error': {'message': error_body}})}\n\n"
         return
+    except (urllib.error.URLError, OSError) as e:
+        yield f"event: error\ndata: {json.dumps({'error': {'message': f'upstream error: {e}'}})}\n\n"
+        return
 
     msg_id = f"msg_{uuid.uuid4().hex[:12]}"
     model_name = openai_body["model"]
 
-    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start','message': {'id': msg_id,'type': 'message','role': 'assistant','content': [],'model': model_name,'stop_reason': None,'stop_sequence': None,'usage': {'input_tokens': 0,'output_tokens': 0}}})}\n\n"
+    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start','message': {'id': msg_id,'type': 'message','role': 'assistant','content': [],'model': model_name,'stop_reason': None,'stop_sequence': None,'usage': {'input_tokens': 0,'output_tokens': 0}}}, ensure_ascii=False)}\n\n"
 
     text_block_open = False
     text_index = None
@@ -327,7 +336,7 @@ def proxy_stream(openai_body: dict):
                 text_block_open = True
                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start','index': text_index,'content_block': {'type': 'text','text': ''}})}\n\n"
             full_text += text
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta','index': text_index,'delta': {'type': 'text_delta','text': text}})}\n\n"
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta','index': text_index,'delta': {'type': 'text_delta','text': text}}, ensure_ascii=False)}\n\n"
 
         for i, tc in enumerate(delta.get("tool_calls") or []):
             idx = tc.get("index", i)
@@ -355,8 +364,8 @@ def proxy_stream(openai_body: dict):
         next_index += 1
         tool_id = acc["id"] or f"toolu_{uuid.uuid4().hex[:12]}"
         args = acc["arguments"] or "{}"
-        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start','index': block_index,'content_block': {'type': 'tool_use','id': tool_id,'name': acc['name'] or '','input': {}}})}\n\n"
-        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta','index': block_index,'delta': {'type': 'input_json_delta','partial_json': args}})}\n\n"
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start','index': block_index,'content_block': {'type': 'tool_use','id': tool_id,'name': acc['name'] or '','input': {}}}, ensure_ascii=False)}\n\n"
+        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta','index': block_index,'delta': {'type': 'input_json_delta','partial_json': args}}, ensure_ascii=False)}\n\n"
         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop','index': block_index})}\n\n"
 
     if tool_calls:
@@ -364,7 +373,7 @@ def proxy_stream(openai_body: dict):
     stop_reason = _FINISH_TO_STOP.get(finish_reason, "end_turn")
     if not usage_out:
         usage_out = len(full_text.split())
-    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta','delta': {'stop_reason': stop_reason,'stop_sequence': None},'usage': {'output_tokens': usage_out}})}\n\n"
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta','delta': {'stop_reason': stop_reason,'stop_sequence': None},'usage': {'output_tokens': usage_out}}, ensure_ascii=False)}\n\n"
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 

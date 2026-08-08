@@ -34,7 +34,7 @@ ADAPTER_PORT = adapter.LISTEN_PORT  # 8082
 
 
 def _fake_generate(prompt, model_id, think_mode, file_refs=None, extra_fields=None):
-    # Echo the model id back so the test can assert which backend model was hit.
+    # Echo the backend mode id (int) back so the test can assert which mode was hit.
     return f"Привет! (model_id={model_id})"
 
 
@@ -94,8 +94,9 @@ class TestIssue3EndToEnd(unittest.TestCase):
         self.assertEqual(data["type"], "message")
         text = "".join(b["text"] for b in data["content"] if b["type"] == "text")
         self.assertIn("Привет", text)
-        # The real backend model must have been a valid one (2.5 family).
-        self.assertIn("gemini-2.5-flash", text)
+        # The request must have hit the real backend model (mode 1 = FAST),
+        # not fallen back to the default or been rejected as unknown.
+        self.assertEqual(data["model"], "gemini-3.5-flash")
         self.assertNotIn("not found", raw)
 
     def test_stream_selected_gemini_flash(self):
@@ -107,7 +108,22 @@ class TestIssue3EndToEnd(unittest.TestCase):
         })
         self.assertEqual(status, 200, raw)
         self.assertIn("message_start", raw)
-        self.assertIn("Привет", raw)
+        # Reassemble the streamed text from the SSE data payloads.
+        streamed = []
+        model = None
+        for ln in raw.split("\n"):
+            if not ln.startswith("data: "):
+                continue
+            try:
+                data = json.loads(ln[6:])
+            except json.JSONDecodeError:
+                continue
+            if data.get("type") == "content_block_delta":
+                streamed.append(data["delta"]["text"])
+            if data.get("type") == "message_start":
+                model = data["message"]["model"]
+        self.assertEqual(model, "gemini-3.5-flash")
+        self.assertIn("Привет", "".join(streamed))
         self.assertNotIn("not found", raw)
 
     def test_models_endpoint_lists_selected_model(self):
